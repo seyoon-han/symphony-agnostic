@@ -1,41 +1,114 @@
-# Symphony
+# symphony-agnostic
 
-Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
-work instead of supervising coding agents.
+> Fork of [openai/symphony](https://github.com/openai/symphony) with support for **Codex, Claude Code, and Gemini** — plus label-based agent routing so each Linear issue is automatically dispatched to the right agent.
 
-[![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](.github/media/symphony-demo.mp4)
+## What's different from the original
 
-_In this [demo video](.github/media/symphony-demo.mp4), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._
+| Feature | openai/symphony | symphony-agnostic |
+|---|---|---|
+| Supported agents | Codex only | Codex, Claude Code, Gemini |
+| Agent selection | hardcoded | Linear label (`codex` / `claude` / `gemini`) |
+| Launcher | manual binary invocation | `symphony [agent] [slug]` from anywhere |
+| Project slug | baked into workflow file | read from project's `.env.local` |
+| Model override | Codex flag only | `--model <name>` on all wrappers |
 
-> [!WARNING]
-> Symphony is a low-key engineering preview for testing in trusted environments.
+## How it works
 
-## Running Symphony
+Run one `symphony` process per agent. Each process polls Linear and only picks up issues labeled for its agent.
 
-### Requirements
+```
+Linear issue (label: codex)   →  symphony codex  →  Codex app-server
+Linear issue (label: claude)  →  symphony claude →  claude-app-server → Claude Code CLI
+Linear issue (label: gemini)  →  symphony gemini →  gemini-app-server → Gemini ACP
+```
 
-Symphony works best in codebases that have adopted
-[harness engineering](https://openai.com/index/harness-engineering/). Symphony is the next step --
-moving from managing coding agents to managing work that needs to get done.
+## Setup
 
-### Option 1. Make your own
+### 1. Prerequisites
 
-Tell your favorite coding agent to build Symphony in a programming language of your choice:
+```bash
+# Codex v0.112+ (not the Homebrew version)
+gh release download rust-v0.112.0 -R openai/codex --pattern 'codex-*-aarch64-apple-darwin.tar.gz' -D /tmp
+tar -xzf /tmp/codex-*.tar.gz -C ~/.local/bin
 
-> Implement Symphony according to the following spec:
-> https://github.com/openai/symphony/blob/main/SPEC.md
+# Claude Code
+npm install -g @anthropic-ai/claude-code
 
-### Option 2. Use our experimental reference implementation
+# Gemini CLI
+npm install -g @google/gemini-cli
+```
 
-Check out [elixir/README.md](elixir/README.md) for instructions on how to set up your environment
-and run the Elixir-based Symphony implementation. You can also ask your favorite coding agent to
-help with the setup:
+### 2. Clone and configure
 
-> Set up Symphony for my repository based on
-> https://github.com/openai/symphony/blob/main/elixir/README.md
+```bash
+git clone https://github.com/seyoon-han/symphony-agnostic ~/symphony
+cd ~/symphony
 
----
+cp .env.example .env
+# Fill in LINEAR_API_KEY and GIT_REPO_URL in .env
+```
 
-## License
+### 3. Install global launcher
 
-This project is licensed under the [Apache License 2.0](LICENSE).
+```bash
+ln -s ~/symphony/symphony.sh ~/.local/bin/symphony
+chmod +x ~/.local/bin/symphony
+```
+
+### 4. Set up Linear labels
+
+Create three labels in your Linear workspace: **`codex`**, **`claude`**, **`gemini`**.
+Tag each issue with the agent you want to handle it.
+
+### 5. Run
+
+```bash
+# In your project directory (saves slug to .env.local automatically on first run)
+symphony codex my-project-abc123
+symphony claude my-project-abc123
+symphony gemini my-project-abc123
+
+# Next time, slug is read from .env.local
+symphony codex
+symphony claude
+symphony gemini
+```
+
+### Model override (optional)
+
+```yaml
+# In workflows/WORKFLOW-claude.md
+codex:
+  command: /Users/yourname/symphony/agents/claude-app-server --model claude-opus-4-6
+
+# In workflows/WORKFLOW-gemini.md
+codex:
+  command: node /Users/yourname/symphony/agents/gemini-app-server --model gemini-2.5-pro
+
+# In workflows/WORKFLOW-codex.md
+codex:
+  command: ~/.local/bin/codex --config model=o3 app-server
+```
+
+Omit `--model` to use each agent's default.
+
+## Architecture
+
+```
+symphony.sh                   # launcher — loads env, patches slug, calls binary
+├── workflows/
+│   ├── WORKFLOW-codex.md     # label_names: [codex]
+│   ├── WORKFLOW-claude.md    # label_names: [claude]
+│   └── WORKFLOW-gemini.md    # label_names: [gemini]
+├── agents/
+│   ├── claude-app-server     # Codex JSON-RPC → Claude Code CLI
+│   └── gemini-app-server     # Codex JSON-RPC → Gemini ACP
+└── elixir/                   # Symphony Elixir orchestrator (modified)
+    └── lib/symphony_elixir/
+        ├── config.ex          # + label_names tracker option
+        └── linear/client.ex   # + label-based issue filtering
+```
+
+## Credits
+
+Built on [openai/symphony](https://github.com/openai/symphony). Agent wrappers and routing additions by [@seyoon-han](https://github.com/seyoon-han).
