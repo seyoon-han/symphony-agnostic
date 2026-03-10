@@ -1,0 +1,5 @@
+.env
+.env.local
+*.beam
+_build/
+deps/

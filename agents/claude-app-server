@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+/**
+ * Claude Code app-server wrapper for Symphony
+ *
+ * Implements the Codex app-server JSON-RPC 2.0 protocol over stdio,
+ * delegating actual work to `claude --print --dangerously-skip-permissions`.
+ */
+
+const { execSync, spawn } = require('child_process');
+const readline = require('readline');
+const crypto = require('crypto');
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+
+// Parse --model flag from argv
+const modelArgIdx = process.argv.indexOf('--model');
+const modelArg = modelArgIdx !== -1 ? process.argv[modelArgIdx + 1] : null;
+
+let threadId = null;
+let threadCwd = null;
+let sessionStarted = false;
+
+function send(obj) {
+  process.stdout.write(JSON.stringify(obj) + '\n');
+}
+
+function handleMessage(line) {
+  let msg;
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    return; // ignore non-JSON
+  }
+
+  const { method, id, params } = msg;
+
+  // ── initialize ──────────────────────────────────────────────────────────────
+  if (method === 'initialize') {
+    send({
+      id,
+      result: {
+        capabilities: { experimentalApi: true },
+        serverInfo: { name: 'claude-app-server', version: '1.0.0' },
+      },
+    });
+    return;
+  }
+
+  // ── initialized (notification, no id) ───────────────────────────────────────
+  if (method === 'initialized') {
+    sessionStarted = true;
+    return;
+  }
+
+  // ── thread/start ─────────────────────────────────────────────────────────────
+  if (method === 'thread/start') {
+    threadId = crypto.randomUUID();
+    threadCwd = params?.cwd || process.cwd();
+    send({ id, result: { thread: { id: threadId } } });
+    return;
+  }
+
+  // ── turn/start ───────────────────────────────────────────────────────────────
+  if (method === 'turn/start') {
+    const turnId = crypto.randomUUID();
+    send({ id, result: { turn: { id: turnId } } });
+
+    const prompt = (params?.input || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('\n');
+
+    const cwd = params?.cwd || threadCwd || process.cwd();
+
+    // Run claude in non-interactive mode
+    const claudeArgs = [
+      '--print',
+      '--dangerously-skip-permissions',
+      '--output-format', 'stream-json',
+      '--include-partial-messages',
+      ...(modelArg ? ['--model', modelArg] : []),
+      prompt,
+    ];
+
+    const child = spawn('claude', claudeArgs, {
+      cwd,
+      env: { ...process.env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let outputBuffer = '';
+
+    child.stdout.on('data', (chunk) => {
+      outputBuffer += chunk.toString();
+      // Parse stream-json lines and forward as notifications
+      const lines = outputBuffer.split('\n');
+      outputBuffer = lines.pop(); // keep incomplete last line
+      for (const l of lines) {
+        if (!l.trim()) continue;
+        try {
+          const evt = JSON.parse(l);
+          // Forward assistant text as content notification
+          if (evt.type === 'assistant' && Array.isArray(evt.message?.content)) {
+            for (const block of evt.message.content) {
+              if (block.type === 'text' && block.text) {
+                send({
+                  method: 'turn/delta',
+                  params: { turnId, type: 'text', text: block.text },
+                });
+              }
+            }
+          }
+        } catch {
+          // non-JSON line from claude - forward as debug
+        }
+      }
+    });
+
+    child.stderr.on('data', (chunk) => {
+      process.stderr.write(chunk);
+    });
+
+    child.on('close', (code) => {
+      if (code === 0) {
+        send({ method: 'turn/completed', params: { turnId } });
+      } else {
+        send({
+          method: 'turn/failed',
+          params: { turnId, reason: `claude exited with code ${code}` },
+        });
+      }
+    });
+
+    child.on('error', (err) => {
+      send({
+        method: 'turn/failed',
+        params: { turnId, reason: err.message },
+      });
+    });
+
+    return;
+  }
+}
+
+rl.on('line', handleMessage);
+
+rl.on('close', () => {
+  process.exit(0);
+});

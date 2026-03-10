@@ -1,0 +1,195 @@
+#!/usr/bin/env node
+/**
+ * Gemini app-server wrapper for Symphony
+ *
+ * Bridges the Codex app-server JSON-RPC protocol (used by Symphony) to
+ * Gemini's ACP (Agent Client Protocol) over stdio.
+ *
+ * Codex protocol: initialize → initialized → thread/start → turn/start
+ * Gemini ACP:     initialize → authenticate → newSession → prompt
+ */
+
+const { spawn } = require('child_process');
+const readline = require('readline');
+const crypto = require('crypto');
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+
+// Parse --model flag from argv
+const modelArgIdx = process.argv.indexOf('--model');
+const modelArg = modelArgIdx !== -1 ? process.argv[modelArgIdx + 1] : null;
+
+let geminiProc = null;
+let geminiReady = false;
+let geminiSessionId = null;
+let pendingGeminiResponses = new Map(); // id → {resolve, reject}
+let acpIdCounter = 10; // ACP request IDs (separate from Symphony IDs)
+
+// ── Start Gemini ACP subprocess ───────────────────────────────────────────────
+function startGemini(cwd) {
+  geminiProc = spawn('gemini', ['--experimental-acp', '--yolo', ...(modelArg ? ['--model', modelArg] : [])], {
+    env: { ...process.env },
+    cwd,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  const geminiRl = readline.createInterface({ input: geminiProc.stdout, crlfDelay: Infinity });
+
+  geminiRl.on('line', (line) => {
+    if (!line.trim()) return;
+    let msg;
+    try { msg = JSON.parse(line); } catch { return; }
+
+    const id = msg.id;
+    if (id !== undefined && pendingGeminiResponses.has(id)) {
+      const { resolve, reject } = pendingGeminiResponses.get(id);
+      pendingGeminiResponses.delete(id);
+      if (msg.error) reject(new Error(`ACP error ${msg.error.code}: ${msg.error.message}`));
+      else resolve(msg.result);
+    }
+  });
+
+  geminiProc.stderr.on('data', (chunk) => {
+    process.stderr.write(chunk);
+  });
+}
+
+function acpSend(method, params) {
+  return new Promise((resolve, reject) => {
+    const id = acpIdCounter++;
+    pendingGeminiResponses.set(id, { resolve, reject });
+    const msg = JSON.stringify({ jsonrpc: '2.0', method, id, params }) + '\n';
+    geminiProc.stdin.write(msg);
+  });
+}
+
+function acpNotify(method, params) {
+  const msg = JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n';
+  geminiProc.stdin.write(msg);
+}
+
+// ── Symphony → Gemini ACP handshake ──────────────────────────────────────────
+async function initGemini(cwd) {
+  // 1. ACP initialize
+  const initResult = await acpSend('initialize', {
+    protocolVersion: 1,
+    capabilities: { fs: { read: true, write: true } },
+    clientInfo: { name: 'symphony-orchestrator', version: '0.1.0' },
+  });
+
+  // 2. ACP notifications/initialized
+  acpNotify('notifications/initialized', {});
+  await new Promise(r => setTimeout(r, 300));
+
+  // 3. Authenticate with existing credentials (oauth-personal)
+  try {
+    await acpSend('authenticate', { methodId: 'oauth-personal' });
+  } catch (e) {
+    // If oauth fails, try gemini-api-key
+    if (process.env.GEMINI_API_KEY) {
+      await acpSend('authenticate', { methodId: 'gemini-api-key' });
+    } else {
+      throw e;
+    }
+  }
+
+  // 4. session/new
+  const sessionResult = await acpSend('session/new', {
+    cwd,
+    mcpServers: [],
+  });
+
+  return sessionResult.sessionId;
+}
+
+// ── Codex protocol: inbound from Symphony ────────────────────────────────────
+function send(obj) {
+  process.stdout.write(JSON.stringify(obj) + '\n');
+}
+
+async function handleMessage(line) {
+  let msg;
+  try { msg = JSON.parse(line); } catch { return; }
+  const { method, id, params } = msg;
+
+  if (method === 'initialize') {
+    send({
+      id,
+      result: {
+        capabilities: { experimentalApi: true },
+        serverInfo: { name: 'gemini-app-server', version: '1.0.0' },
+      },
+    });
+    return;
+  }
+
+  if (method === 'initialized') {
+    return;
+  }
+
+  if (method === 'thread/start') {
+    const cwd = params?.cwd || process.cwd();
+    try {
+      startGemini(cwd);
+      await new Promise(r => setTimeout(r, 500)); // wait for process
+      geminiSessionId = await initGemini(cwd);
+      const threadId = crypto.randomUUID();
+      send({ id, result: { thread: { id: threadId } } });
+    } catch (e) {
+      send({ id, error: { code: -32603, message: e.message } });
+    }
+    return;
+  }
+
+  if (method === 'turn/start') {
+    const turnId = crypto.randomUUID();
+    send({ id, result: { turn: { id: turnId } } });
+
+    const prompt = (params?.input || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('\n');
+
+    const cwd = params?.cwd || process.cwd();
+
+    try {
+      // Stream events from Gemini ACP prompt
+      const acpId = acpIdCounter++;
+      pendingGeminiResponses.set(acpId, {
+        resolve: () => {
+          send({ method: 'turn/completed', params: { turnId } });
+        },
+        reject: (e) => {
+          send({ method: 'turn/failed', params: { turnId, reason: e.message } });
+        },
+      });
+
+      // Set up streaming before sending
+      const geminiRl = readline.createInterface({ input: geminiProc.stdout, crlfDelay: Infinity });
+      // Note: previous readline still active; we handle in-flight updates via geminiProc.stdout
+      // Use a simpler approach: poll the existing readline
+
+      geminiProc.stdin.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'session/prompt',
+          id: acpId,
+          params: {
+            sessionId: geminiSessionId,
+            prompt: [{ type: 'text', text: prompt }],
+            cwd,
+          },
+        }) + '\n'
+      );
+    } catch (e) {
+      send({ method: 'turn/failed', params: { turnId, reason: e.message } });
+    }
+    return;
+  }
+}
+
+rl.on('line', handleMessage);
+rl.on('close', () => {
+  if (geminiProc) geminiProc.kill();
+  process.exit(0);
+});

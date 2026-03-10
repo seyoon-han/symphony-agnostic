@@ -61,6 +61,10 @@ defmodule SymphonyElixir.Config do
                                  terminal_states: [
                                    type: {:list, :string},
                                    default: @default_terminal_states
+                                 ],
+                                 label_names: [
+                                   type: {:list, :string},
+                                   default: []
                                  ]
                                ]
                              ],
@@ -217,6 +221,11 @@ defmodule SymphonyElixir.Config do
   @spec linear_terminal_states() :: [String.t()]
   def linear_terminal_states do
     get_in(validated_workflow_options(), [:tracker, :terminal_states])
+  end
+
+  @spec linear_label_names() :: [String.t()]
+  def linear_label_names do
+    get_in(validated_workflow_options(), [:tracker, :label_names])
   end
 
   @spec poll_interval_ms() :: pos_integer()
@@ -465,6 +474,7 @@ defmodule SymphonyElixir.Config do
     |> put_if_present(:project_slug, scalar_string_value(Map.get(section, "project_slug")))
     |> put_if_present(:active_states, csv_value(Map.get(section, "active_states")))
     |> put_if_present(:terminal_states, csv_value(Map.get(section, "terminal_states")))
+    |> put_if_present(:label_names, csv_value(Map.get(section, "label_names")))
   end
 
   defp extract_polling_options(section) do
